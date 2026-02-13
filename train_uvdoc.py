@@ -74,6 +74,10 @@ def write_log_file(log_file_name, loss, epoch, lrate, phase):
 
 
 def main_worker(args):
+    print("CUDA available:", torch.cuda.is_available())
+    print("Current device:", torch.cuda.current_device() if torch.cuda.is_available() else "CPU")
+    print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+
     trainloader, valloader = setup_data(args)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
