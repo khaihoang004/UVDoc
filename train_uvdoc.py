@@ -15,45 +15,41 @@ gamma_w = 0.0
 
 def setup_data(args):
     """
-    Returns train and validation dataloader (UVDoc ONLY).
+    UVDoc only (no split)
     """
     UVDoc = data_UVDoc.UVDocDataset
-    traindata = "train"
-    valdata = "val"
 
-    # Training data (UVDoc only)
-    t_UVDoc_data = UVDoc(
+    train_data = UVDoc(
         data_path=args.data_path_UVDoc,
-        split=traindata,
         appearance_augmentation=args.appearance_augmentation,
         geometric_augmentations=args.geometric_augmentationsUVDoc,
     )
 
     trainloader = torch.utils.data.DataLoader(
-        t_UVDoc_data,
+        train_data,
         batch_size=args.batch_size,
-        num_workers=args.num_workers,
         shuffle=True,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
 
-    # Validation data (UVDoc only)
-    v_UVDoc_data = UVDoc(
+    # Eval dataset: same UVDoc but NO augmentation
+    val_data = UVDoc(
         data_path=args.data_path_UVDoc,
-        split=valdata,
         appearance_augmentation=[],
         geometric_augmentations=[],
     )
 
     valloader = torch.utils.data.DataLoader(
-        v_UVDoc_data,
+        val_data,
         batch_size=args.batch_size,
-        num_workers=args.num_workers,
         shuffle=False,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
 
     return trainloader, valloader
+
 
 
 def get_scheduler(optimizer, args, epoch_start):
