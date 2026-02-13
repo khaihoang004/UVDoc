@@ -3,15 +3,11 @@ import gc
 import os
 
 import torch
+from tqdm import tqdm
 
 import data_UVDoc
 import model
 import utils
-
-train_mse = 0.0
-losscount = 0
-gamma_w = 0.0
-
 
 def setup_data(args):
     """
@@ -33,7 +29,7 @@ def setup_data(args):
         pin_memory=True,
     )
 
-    # Eval dataset: same UVDoc but NO augmentation
+    # Validation: same dataset, NO augmentation
     val_data = UVDoc(
         data_path=args.data_path_UVDoc,
         appearance_augmentation=[],
@@ -51,172 +47,197 @@ def setup_data(args):
     return trainloader, valloader
 
 
-
 def get_scheduler(optimizer, args, epoch_start):
     def lambda_rule(epoch):
-        lr_l = 1.0 - max(0, epoch + epoch_start - args.n_epochs) / float(args.n_epochs_decay + 1)
+        lr_l = 1.0 - max(
+            0, epoch + epoch_start - args.n_epochs
+        ) / float(args.n_epochs_decay + 1)
         return lr_l
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_rule)
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda_rule
+    )
 
 
 def update_learning_rate(scheduler, optimizer):
     old_lr = optimizer.param_groups[0]["lr"]
     scheduler.step()
-    lr = optimizer.param_groups[0]["lr"]
-    print("learning rate update from %.7f -> %.7f" % (old_lr, lr))
-    return lr
+    new_lr = optimizer.param_groups[0]["lr"]
+    print(f"Learning rate: {old_lr:.7f} -> {new_lr:.7f}")
+    return new_lr
 
 
-def write_log_file(log_file_name, loss, epoch, lrate, phase):
+def write_log_file(log_file_name, loss, epoch, lr, phase):
     with open(log_file_name, "a") as f:
-        f.write("\n{} LRate: {} Epoch: {} MSE: {:.5f} ".format(phase, lrate, epoch, loss))
+        f.write(
+            f"\n{phase} | Epoch {epoch:03d} | "
+            f"LR {lr:.6f} | MSE {loss:.6f}"
+        )
 
 
 def main_worker(args):
+    # ---- Device ----
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("CUDA available:", torch.cuda.is_available())
-    print("Current device:", torch.cuda.current_device() if torch.cuda.is_available() else "CPU")
-    print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+    if torch.cuda.is_available():
+        print("GPU:", torch.cuda.get_device_name(0))
+    print("Using device:", device)
 
+    # ---- Data ----
     trainloader, valloader = setup_data(args)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    UVDocnet = model.UVDocnet(num_filter=32, kernel_size=5)
-    UVDocnet.to(device)
+    # ---- Model ----
+    UVDocnet = model.UVDocnet(num_filter=32, kernel_size=5).to(device)
 
-    # Losses
-    criterionL1 = torch.nn.L1Loss()
-    criterionMSE = torch.nn.MSELoss()
+    # ---- Loss ----
+    criterion_L1 = torch.nn.L1Loss()
+    criterion_MSE = torch.nn.MSELoss()
 
-    optimizer = torch.optim.Adam(UVDocnet.parameters(), lr=args.lr, betas=(0.9, 0.999))
+    optimizer = torch.optim.Adam(
+        UVDocnet.parameters(), lr=args.lr, betas=(0.9, 0.999)
+    )
 
-    global gamma_w
+    gamma_w = 0.0
     epoch_start = 0
 
+    # ---- Resume ----
     if args.resume is not None and os.path.isfile(args.resume):
-        print(f"Loading checkpoint '{args.resume}'")
-        checkpoint = torch.load(args.resume)
-        UVDocnet.load_state_dict(checkpoint["model_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        epoch_start = checkpoint["epoch"]
+        print(f"Loading checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume)
+        UVDocnet.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        epoch_start = ckpt["epoch"]
         if epoch_start >= args.ep_gamma_start:
             gamma_w = args.gamma_w
 
     scheduler = get_scheduler(optimizer, args, epoch_start)
 
-    # Logging
+    # ---- Logging dir ----
     os.makedirs(args.logdir, exist_ok=True)
 
-    experiment_name = (
-        "UVDOC_"
-        + "bs"
-        + str(args.batch_size)
-        + "_lr"
-        + str(args.lr)
-        + "_nep"
-        + str(args.n_epochs)
-        + "_alpha"
-        + str(args.alpha_w)
-        + "_beta"
-        + str(args.beta_w)
-        + "_gamma"
-        + str(args.gamma_w)
+    exp_name = (
+        f"UVDOC_bs{args.batch_size}_lr{args.lr}"
+        f"_ep{args.n_epochs}_a{args.alpha_w}"
+        f"_b{args.beta_w}_g{args.gamma_w}"
     )
 
-    log_file_name = os.path.join(args.logdir, experiment_name + ".txt")
-    with open(log_file_name, "a") as f:
-        f.write("\n---------------  " + experiment_name + "  ---------------\n")
+    log_file = os.path.join(args.logdir, exp_name + ".txt")
+    exp_dir = os.path.join(args.logdir, exp_name)
+    os.makedirs(exp_dir, exist_ok=True)
 
-    exp_log_dir = os.path.join(args.logdir, experiment_name)
-    os.makedirs(exp_log_dir, exist_ok=True)
+    with open(log_file, "a") as f:
+        f.write(f"\n===== {exp_name} =====\n")
 
-    global losscount, train_mse
+    best_val_mse = float("inf")
 
-    # ==========================
+    # =========================
     # Training loop
-    # ==========================
-    for epoch in range(epoch_start, args.n_epochs + args.n_epochs_decay + 1):
-        print(f"\n----- Epoch {epoch} -----")
+    # =========================
+    for epoch in range(epoch_start, args.n_epochs + args.n_epochs_decay):
+        print(f"\n===== Epoch {epoch} =====")
 
         if epoch >= args.ep_gamma_start:
             gamma_w = args.gamma_w
-            print("gamma_w activated:", gamma_w)
 
-        train_mse = 0.0
-        losscount = 0
-        best_val_mse = float("inf")
-
+        # ---------- TRAIN ----------
         UVDocnet.train()
+        train_mse = 0.0
+        count = 0
 
-        for imgs_, imgs_unwarped_, grid2D_, grid3D_ in trainloader:
+        pbar = tqdm(
+            trainloader,
+            desc=f"Train {epoch}",
+            total=len(trainloader),
+        )
+
+        for imgs_, imgs_unw_, grid2D_, grid3D_ in pbar:
             imgs = imgs_.to(device, non_blocking=True)
-            unwarped_GT = imgs_unwarped_.to(device, non_blocking=True)
-            grid2D_GT = grid2D_.to(device, non_blocking=True)
-            grid3D_GT = grid3D_.to(device, non_blocking=True)
+            gt_unw = imgs_unw_.to(device, non_blocking=True)
+            gt_2d = grid2D_.to(device, non_blocking=True)
+            gt_3d = grid3D_.to(device, non_blocking=True)
 
-            grid2D_pred, grid3D_pred = UVDocnet(imgs)
-            unwarped_pred = utils.bilinear_unwarping(imgs, grid2D_pred, utils.IMG_SIZE)
+            pred_2d, pred_3d = UVDocnet(imgs)
+            pred_unw = utils.bilinear_unwarping(
+                imgs, pred_2d, utils.IMG_SIZE
+            )
+
+            loss_recon = criterion_L1(pred_unw, gt_unw)
+            loss_2d = criterion_L1(pred_2d, gt_2d)
+            loss_3d = criterion_L1(pred_3d, gt_3d)
+
+            loss = (
+                args.alpha_w * loss_2d
+                + args.beta_w * loss_3d
+                + gamma_w * loss_recon
+            )
 
             optimizer.zero_grad(set_to_none=True)
-
-            recon_loss = criterionL1(unwarped_pred, unwarped_GT)
-            loss_grid2D = criterionL1(grid2D_pred, grid2D_GT)
-            loss_grid3D = criterionL1(grid3D_pred, grid3D_GT)
-
-            netLoss = args.alpha_w * loss_grid2D + args.beta_w * loss_grid3D + gamma_w * recon_loss
-            netLoss.backward()
+            loss.backward()
             optimizer.step()
 
-            tmp_mse = criterionMSE(unwarped_pred, unwarped_GT)
-            train_mse += float(tmp_mse)
-            losscount += 1
+            mse = criterion_MSE(pred_unw, gt_unw)
+            train_mse += mse.detach().item()
+            count += 1
 
-            gc.collect()
-
-        train_mse /= max(1, losscount)
-        curr_lr = update_learning_rate(scheduler, optimizer)
-        write_log_file(log_file_name, train_mse, epoch + 1, curr_lr, "Train")
-
-        # Validation
-        UVDocnet.eval()
-        with torch.no_grad():
-            mse_loss_val = 0.0
-            for imgs_, imgs_unwarped_, _, _ in valloader:
-                imgs = imgs_.to(device)
-                unwarped_GT = imgs_unwarped_.to(device)
-
-                grid2D_pred, _ = UVDocnet(imgs)
-                unwarped_pred = utils.bilinear_unwarping(imgs, grid2D_pred, utils.IMG_SIZE)
-
-                loss_img_val = criterionMSE(unwarped_pred, unwarped_GT)
-                mse_loss_val += float(loss_img_val)
-
-            val_mse = mse_loss_val / len(valloader)
-            write_log_file(log_file_name, val_mse, epoch + 1, curr_lr, "Val")
-
-        # Save best
-        if val_mse < best_val_mse or epoch == args.n_epochs + args.n_epochs_decay:
-            best_val_mse = val_mse
-            state = {
-                "epoch": epoch + 1,
-                "model_state": UVDocnet.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-            }
-            model_path = os.path.join(
-                exp_log_dir,
-                f"ep_{epoch + 1}_{val_mse:.5f}_{train_mse:.5f}_best_model.pkl",
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                mse=f"{mse.item():.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
-            torch.save(state, model_path)
 
+        train_mse /= max(1, count)
+        lr = update_learning_rate(scheduler, optimizer)
+        write_log_file(log_file, train_mse, epoch + 1, lr, "Train")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # ---------- VALID ----------
+        UVDocnet.eval()
+        val_mse = 0.0
+
+        with torch.no_grad():
+            for imgs_, imgs_unw_, _, _ in tqdm(
+                valloader,
+                desc=f"Val {epoch}",
+                total=len(valloader),
+            ):
+                imgs = imgs_.to(device)
+                gt_unw = imgs_unw_.to(device)
+
+                pred_2d, _ = UVDocnet(imgs)
+                pred_unw = utils.bilinear_unwarping(
+                    imgs, pred_2d, utils.IMG_SIZE
+                )
+
+                val_mse += criterion_MSE(pred_unw, gt_unw).item()
+
+        val_mse /= len(valloader)
+        write_log_file(log_file, val_mse, epoch + 1, lr, "Val")
+
+        # ---------- SAVE ----------
+        if val_mse < best_val_mse:
+            best_val_mse = val_mse
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state": UVDocnet.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                },
+                os.path.join(
+                    exp_dir,
+                    f"best_ep{epoch+1}_val{val_mse:.5f}.pkl",
+                ),
+            )
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train UVDoc only")
+    parser = argparse.ArgumentParser("Train UVDoc")
 
     parser.add_argument("--data_path_UVDoc", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--n_epochs", type=int, default=10)
     parser.add_argument("--n_epochs_decay", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=0.0002)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--alpha_w", type=float, default=5.0)
     parser.add_argument("--beta_w", type=float, default=5.0)
     parser.add_argument("--gamma_w", type=float, default=1.0)
@@ -225,18 +246,14 @@ if __name__ == "__main__":
     parser.add_argument("--logdir", type=str, default="./log/uvdoc")
 
     parser.add_argument(
-        "-a",
         "--appearance_augmentation",
         nargs="*",
         default=["visual", "noise", "color"],
-        choices=["shadow", "blur", "visual", "noise", "color"],
     )
     parser.add_argument(
-        "-gUVDoc",
         "--geometric_augmentationsUVDoc",
         nargs="*",
         default=["rotate"],
-        choices=["rotate", "flip", "perspective"],
     )
     parser.add_argument("--num_workers", type=int, default=8)
 
